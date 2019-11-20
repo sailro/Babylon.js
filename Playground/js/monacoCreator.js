@@ -51,6 +51,9 @@ class MonacoCreator {
      * Load the Monaco Node module.
      */
     async loadMonaco(typings) {
+        // debug!!!
+        typings = "babylon.d.ts.txt";
+
         let response = await fetch(typings || "https://preview.babylonjs.com/babylon.d.ts");
         if (!response.ok)
             return;
@@ -199,11 +202,40 @@ class MonacoCreator {
         editorOptions.minimap.enabled = document.getElementById("minimapToggle1280").classList.contains('checked');
         this.jsEditor = monaco.editor.create(document.getElementById('jsEditor'), editorOptions);
 
+
         this.jsEditor.setValue(oldCode);
-        this.jsEditor.onKeyUp(function () {
+        this.jsEditor.onDidChangeModelContent(function () {
             this.parent.utils.markDirty();
+            this.refreshObsoleteMarkers();
         }.bind(this));
     };
+
+    async refreshObsoleteMarkers() {
+        console.log("refreshObsoleteMarkers");
+
+        const model = this.jsEditor.getModel();
+        const uri = model.uri;
+
+        const worker = await monaco.languages.typescript.getTypeScriptWorker();
+        const languageService = await worker(uri);
+
+        // we add \n{0} to workaround a Monaco bug, when setting regex options on their side
+        const matches = model.findMatches(".", null, false, true, null, false);
+
+        matches.forEach(async m => {
+            const position = { lineNumber: m.range.startLineNumber, column: m.range.startColumn };
+            const wordInfo = model.getWordUntilPosition(position);
+            const offset = model.getOffsetAt(position);
+
+            const details = await languageService.getCompletionEntryDetails(uri.toString(), offset, wordInfo.word);
+            if (details && details.tags) {
+                const deprecatedInfo = details.tags.find(tag => tag.name == "deprecated");
+                if (deprecatedInfo) {
+                    debugger;
+                }
+            }
+        });
+    }
 
     detectLanguage(text) {
         return text && text.indexOf("class Playground") >= 0 ? "typescript" : "javascript";
