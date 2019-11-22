@@ -10,6 +10,7 @@ class MonacoCreator {
         this.diffNavigator = null;
         this.monacoMode = "javascript";
         this.blockEditorChange = false;
+        this.markerWorker = null;
 
         this.compilerTriggerTimeoutID = null;
     }
@@ -61,6 +62,7 @@ class MonacoCreator {
         require(['vs/editor/editor.main'], () => {
             this.setupMonacoCompilationPipeline(libContent);
             this.setupMonacoColorProvider();
+            this.setupMonacoMarkers();
 
             require(['vs/language/typescript/languageFeatures'], module => {
                 this.hookMonacoCompletionProvider(module.SuggestAdapter);
@@ -69,6 +71,30 @@ class MonacoCreator {
             this.parent.main.run();
         });
     };
+
+    setupMonacoMarkers() {
+        this.markerWorker = new Worker('js/marker.worker.js');
+        this.markerWorker.addEventListener('message', ({data}) => this.updateMonacoMarkers(data));        
+    }
+
+    updateMonacoMarkers({markers, version}) {
+        const model = this.jsEditor.getModel();
+
+        if (model && model.getVersionId() === version) {
+          monaco.editor.setModelMarkers(model, 'babylonjs', markers);
+        }
+    }
+
+    analyzeCode() {
+        const model = this.jsEditor.getModel();
+
+        monaco.editor.setModelMarkers(model, 'babylonjs', []);
+    
+        this.markerWorker.postMessage({
+          code: model.getValue(),
+          version: model.getVersionId(),
+        });
+    }
 
     hookMonacoCompletionProvider(provider) {
         const hooked = provider.prototype.provideCompletionItems;
@@ -200,8 +226,9 @@ class MonacoCreator {
         this.jsEditor = monaco.editor.create(document.getElementById('jsEditor'), editorOptions);
 
         this.jsEditor.setValue(oldCode);
-        this.jsEditor.onKeyUp(function () {
+        this.jsEditor.onDidChangeModelContent(function () {
             this.parent.utils.markDirty();
+            this.analyzeCode();
         }.bind(this));
     };
 
