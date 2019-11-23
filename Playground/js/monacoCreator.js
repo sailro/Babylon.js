@@ -62,7 +62,7 @@ class MonacoCreator {
         require(['vs/editor/editor.main'], () => {
             this.setupMonacoCompilationPipeline(libContent);
             this.setupMonacoColorProvider();
-            this.setupMonacoMarkers();
+            this.setupMonacoMarkers(libContent);
 
             require(['vs/language/typescript/languageFeatures'], module => {
                 this.hookMonacoCompletionProvider(module.SuggestAdapter);
@@ -72,9 +72,14 @@ class MonacoCreator {
         });
     };
 
-    setupMonacoMarkers() {
-        this.markerWorker = new Worker('js/marker.worker.js');
+    setupMonacoMarkers(libContent) {
+        this.markerWorker = new Worker('js/markerWorker.js');
         this.markerWorker.addEventListener('message', ({data}) => this.updateMonacoMarkers(data));        
+        this.markerWorker.postMessage({
+            type: 'definition',
+            code: libContent,
+            version: 0,
+        });
     }
 
     updateMonacoMarkers({markers, version}) {
@@ -91,6 +96,7 @@ class MonacoCreator {
         monaco.editor.setModelMarkers(model, 'babylonjs', []);
     
         this.markerWorker.postMessage({
+          type: 'script',
           code: model.getValue(),
           version: model.getVersionId(),
         });
