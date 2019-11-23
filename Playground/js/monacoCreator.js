@@ -10,7 +10,8 @@ class MonacoCreator {
         this.diffNavigator = null;
         this.monacoMode = "javascript";
         this.blockEditorChange = false;
-        this.markerWorker = null;
+        this.definitionWorker = null;
+		this.deprecatedCandidates = [];
 
         this.compilerTriggerTimeoutID = null;
     }
@@ -52,17 +53,21 @@ class MonacoCreator {
      * Load the Monaco Node module.
      */
     async loadMonaco(typings) {
+		// debug
+		typings = "babylon.d.ts.txt"
+		
         let response = await fetch(typings || "https://preview.babylonjs.com/babylon.d.ts");
         if (!response.ok)
             return;
 
         const libContent = await response.text();
+        this.setupDefinitionWorker(libContent);
+
         require.config({ paths: { 'vs': 'node_modules/monaco-editor/dev/vs' } });
 
         require(['vs/editor/editor.main'], () => {
             this.setupMonacoCompilationPipeline(libContent);
             this.setupMonacoColorProvider();
-            this.setupMonacoMarkers(libContent);
 
             require(['vs/language/typescript/languageFeatures'], module => {
                 this.hookMonacoCompletionProvider(module.SuggestAdapter);
@@ -72,52 +77,106 @@ class MonacoCreator {
         });
     };
 
-    setupMonacoMarkers(libContent) {
-        this.markerWorker = new Worker('js/markerWorker.js');
-        this.markerWorker.addEventListener('message', ({data}) => this.updateMonacoMarkers(data));        
-        this.markerWorker.postMessage({
-            type: 'definition',
-            code: libContent,
-            version: 0,
+    setupDefinitionWorker(libContent) {
+        this.definitionWorker = new Worker('js/definitionWorker.js');
+        this.definitionWorker.addEventListener('message', ({data}) => {
+            this.deprecatedCandidates = data.result;
+            this.analyzeCode();
         });
+        this.definitionWorker.postMessage({code: libContent});
     }
 
-    updateMonacoMarkers({markers, version}) {
-        const model = this.jsEditor.getModel();
-
-        if (model && model.getVersionId() === version) {
-          monaco.editor.setModelMarkers(model, 'babylonjs', markers);
-        }
+    isDeprecatedEntry(details) {
+        return details
+            && details.tags
+            && details.tags.find(this.isDeprecatedTag);
     }
 
-    analyzeCode() {
-        const model = this.jsEditor.getModel();
+    isDeprecatedTag(tag) {
+        return tag
+            && tag.name == "deprecated";
+    }    
 
-        monaco.editor.setModelMarkers(model, 'babylonjs', []);
+    async analyzeCode() {
+        // if the definition worker is very fast, this can be called out of context
+        if (!this.jsEditor)
+            return;
+
+        const model = this.jsEditor.getModel();
+        if (!model)
+            return;
+
+        const uri = model.uri;
+
+        let worker = null;
+        if (this.parent.settingsPG.ScriptLanguage == "JS")
+            worker = await monaco.languages.typescript.getJavaScriptWorker();
+        else
+            worker = await monaco.languages.typescript.getTypeScriptWorker();
+
+        const languageService = await worker(uri);
+        const source = 'babylonjs';
+
+        monaco.editor.setModelMarkers(model, source, []);
+        const markers = [];
+        
+		for (const candidate of this.deprecatedCandidates) {
+			const matches = model.findMatches(candidate, null, false, true, null, false);
+			for (const match of matches) {
+                const position = { lineNumber: match.range.startLineNumber, column: match.range.startColumn };
+                const wordInfo = model.getWordAtPosition(position);
+                const offset = model.getOffsetAt(position);
     
-        this.markerWorker.postMessage({
-          type: 'script',
-          code: model.getValue(),
-          version: model.getVersionId(),
-        });
-    }
-
-    hookMonacoCompletionProvider(provider) {
-        const hooked = provider.prototype.provideCompletionItems;
-
-        const suggestionFilter = function(suggestion) {
-            return !suggestion.label.startsWith("_");
+                // the following is time consuming on all suggestions, that's why we precompute deprecated candidate names in the definition worker to filter calls
+                const details = await languageService.getCompletionEntryDetails(uri.toString(), offset, wordInfo.word);
+                if (this.isDeprecatedEntry(details)) {
+                    const deprecatedInfo = details.tags.find(this.isDeprecatedTag);
+                    markers.push({
+                        startLineNumber: match.range.startLineNumber,
+                        endLineNumber: match.range.endLineNumber,
+                        startColumn: match.range.startColumn,
+                        endColumn: match.range.endColumn,
+                        message: deprecatedInfo.text,
+                        severity: monaco.MarkerSeverity.Warning,
+                        source: source,
+                    });
+                }                
+			}
         }
+
+        monaco.editor.setModelMarkers(model, source, markers);
+    }
+	
+    hookMonacoCompletionProvider(provider) {
+        const provideCompletionItems = provider.prototype.provideCompletionItems;
+		const owner = this;
 
         provider.prototype.provideCompletionItems = async function(model, position, context, token) {
             // reuse 'this' to preserve context through call (using apply)
-            var result = await hooked.apply(this, [model, position, context, token]);
-            
+            const result = await provideCompletionItems.apply(this, [model, position, context, token]);
+			
             if (!result || !result.suggestions)
                 return result;
 
-            const suggestions = result.suggestions.filter(suggestionFilter);
-            const incomplete = result.incomplete && result.incomplete == true;
+            const suggestions = result.suggestions.filter(item => !item.label.startsWith("_"));
+			
+			for (const suggestion of suggestions) {
+				if (owner.deprecatedCandidates.includes(suggestion.label)) {
+					
+					// the following is time consuming on all suggestions, that's why we precompute deprecated candidate names in the definition worker to filter calls
+					const uri = suggestion.uri;
+                    const worker = await this._worker(uri);
+					const model = monaco.editor.getModel(uri);
+					const details = await worker.getCompletionEntryDetails(uri.toString(), model.getOffsetAt(position), suggestion.label)
+					
+					if (owner.isDeprecatedEntry(details)) {
+						suggestion.tags = [monaco.languages.CompletionItemTag.Deprecated];
+					}
+				}
+			}
+			
+			// preserve incomplete flag or force it when the definition is not yet analyzed
+            const incomplete = (result.incomplete && result.incomplete == true) || owner.deprecatedCandidates.length == 0;
 
             return { 
                 suggestions: suggestions,
